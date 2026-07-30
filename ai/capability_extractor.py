@@ -21,6 +21,22 @@ CapabilityCategory = Literal[
     "communications",
     "cloud",
     "software_engineering",
+    "data_analytics",
+    "decision_support",
+    "command_and_control",
+    "geospatial_intelligence",
+    "electronic_warfare",
+    "digital_engineering",
+    "modeling_and_simulation",
+    "systems_integration",
+    "test_and_evaluation",
+    "devsecops",
+    "identity_and_access_management",
+    "edge_computing",
+    "unmanned_systems",
+    "logistics",
+    "maintenance",
+    "training",
     "other",
 ]
 
@@ -129,6 +145,8 @@ Rules:
 - Do not connect any company to the opportunity.
 - Confidence reflects support for the extracted label, not a procurement
   outcome or prediction.
+- Prefer the most specific available capability category. Use "other" only
+  when none of the defined technical or mission categories fit.
 """.strip()
 
     user_input = (

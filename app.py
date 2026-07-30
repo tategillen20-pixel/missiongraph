@@ -1,7 +1,11 @@
-"""Streamlit entry point for the MissionGraph application."""
+"""Professional Streamlit interface for MissionGraph."""
 
+from __future__ import annotations
+
+from collections import Counter
 from datetime import date
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import streamlit as st
@@ -14,8 +18,10 @@ from data.normalizer import normalize_award_records
 from data.opportunity_normalizer import normalize_opportunity
 from graph.builder import (
     add_extracted_capabilities_to_graph,
+    build_award_graph,
     build_opportunity_graph,
 )
+from graph.visualization import graph_to_dot
 from services.samgov import (
     SamGovError,
     fetch_opportunity_description,
@@ -23,365 +29,1172 @@ from services.samgov import (
 )
 from services.usaspending import USAspendingAPIError, search_contract_awards
 
+PUBLIC_DATA_CACHE_TTL = 900
 
-def _results_table(records: list[dict[str, Any]]) -> pd.DataFrame:
-    """Create the user-facing results table from normalized award records."""
+
+@st.cache_data(ttl=PUBLIC_DATA_CACHE_TTL, show_spinner=False)
+def _cached_award_search(
+    keyword: str,
+    start_date: str,
+    end_date: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Cache identical public USAspending searches for 15 minutes."""
+    return search_contract_awards(keyword, start_date, end_date, limit)
+
+
+@st.cache_data(ttl=PUBLIC_DATA_CACHE_TTL, show_spinner=False)
+def _cached_opportunity_search(
+    start_date: str,
+    end_date: str,
+    title: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Cache identical public SAM.gov searches for 15 minutes."""
+    return search_opportunities(
+        start_date=start_date,
+        end_date=end_date,
+        title=title or None,
+        page_size=limit,
+        max_pages=1,
+    )
+
+
+def _initialize_state() -> None:
+    """Initialize persistent UI state without overwriting prior searches."""
+    defaults = {
+        "award_records": None,
+        "award_validation_errors": [],
+        "award_selection": None,
+        "award_query": "",
+        "opportunity_records": None,
+        "opportunity_raw_by_id": {},
+        "opportunity_validation_errors": [],
+        "opportunity_selection": None,
+        "opportunity_query": "",
+        "description_retrieved": set(),
+        "capability_extractions": {},
+        "show_sam_graph_demo": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _safe_public_url(value: Any) -> str:
+    """Remove API-key query parameters before displaying a public source URL."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    parts = urlsplit(value.strip())
+    if parts.scheme not in {"http", "https"}:
+        return ""
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if key.casefold() != "api_key"
+    ]
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), "")
+    )
+
+
+def _display_value(value: Any, fallback: str = "Not provided") -> str:
+    """Return a readable value for optional public-data fields."""
+    if value is None or str(value).strip() == "":
+        return fallback
+    return str(value)
+
+
+def _format_currency(value: Any) -> str:
+    """Format a numeric award value as US currency."""
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "Not provided"
+
+
+def _format_date(value: Any, include_time: bool | None = None) -> str:
+    """Format common API date strings for readable display."""
+    if value is None or not str(value).strip():
+        return "Not provided"
+    text = str(value).strip()
+    try:
+        timestamp = pd.Timestamp(text)
+    except (TypeError, ValueError):
+        return text
+    if pd.isna(timestamp):
+        return "Not provided"
+
+    date_label = timestamp.strftime("%b %d, %Y").replace(" 0", " ")
+    show_time = include_time
+    if show_time is None:
+        show_time = "T" in text or " " in text.strip()
+    if not show_time:
+        return date_label
+
+    time_label = timestamp.strftime("%I:%M %p").lstrip("0")
+    timezone_label = timestamp.strftime("%Z") or timestamp.strftime("%z")
+    suffix = f" {timezone_label}" if timezone_label else ""
+    return f"{date_label} at {time_label}{suffix}"
+
+
+def _shorten(value: Any, limit: int = 140) -> str:
+    """Return a compact one-line preview without losing the full source text."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def truncate_at_word_boundary(value: str, max_length: int = 75) -> str:
+    """Shorten display text without splitting the final visible word."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_length:
+        return text
+    if max_length <= 1:
+        return "…"[:max_length]
+    candidate = text[: max_length - 1]
+    if candidate and not candidate[-1].isspace():
+        candidate = candidate.rsplit(" ", 1)[0]
+    candidate = candidate.rstrip()
+    return (candidate or text[: max_length - 1].rstrip()) + "…"
+
+
+def _award_dropdown_label(
+    record: dict[str, Any],
+    duplicate_contractor_names: set[str],
+) -> str:
+    """Format an award choice while keeping its source ID out of view."""
+    contractor = _display_value(record.get("recipient_name"))
+    if contractor.casefold() not in duplicate_contractor_names:
+        return contractor
+    context = record.get("description") or (
+        record.get("awarding_sub_agency") or record.get("awarding_agency")
+    )
+    context_label = truncate_at_word_boundary(str(context or ""), 58)
+    return f"{contractor} — {context_label}" if context_label else contractor
+
+
+def _opportunity_dropdown_label(record: dict[str, Any]) -> str:
+    """Format an opportunity choice without exposing its notice ID."""
+    title = truncate_at_word_boundary(str(record.get("title") or ""), 75)
+    organization = (
+        record.get("issuing_office")
+        or record.get("department")
+        or record.get("organization_path")
+        or "Organization not provided"
+    )
+    return f"{title or 'Untitled opportunity'} — {organization}"
+
+
+def _confidence_label(score: float) -> str:
+    """Translate model confidence into a cautious qualitative band."""
+    if score >= 0.80:
+        return "High"
+    if score >= 0.55:
+        return "Moderate"
+    return "Low"
+
+
+def _humanize_category(value: Any) -> str:
+    """Convert an extraction category key into a readable label."""
+    return str(value).replace("_", " ").title()
+
+
+def _why_award_matched(record: dict[str, Any], query: str) -> str:
+    """Explain which visible award field contains the submitted keyword."""
+    term = query.strip().casefold()
+    if not term:
+        return "No keyword was retained for this search."
+    if term in str(record.get("description", "")).casefold():
+        return "Description"
+    agency = " ".join(
+        [
+            str(record.get("awarding_agency", "")),
+            str(record.get("awarding_sub_agency", "")),
+        ]
+    ).casefold()
+    if term in agency:
+        return "Agency"
+    return "USAspending keyword index; the matching field is not returned."
+
+
+def _why_opportunity_matched(
+    record: dict[str, Any],
+    query: str,
+    extraction: dict[str, Any] | None,
+) -> str:
+    """Explain which visible opportunity field contains the submitted term."""
+    term = query.strip().casefold()
+    if not term:
+        return "Active-notice search; no title keyword was supplied."
+    if term in str(record.get("title", "")).casefold():
+        return "Title"
+    if term in str(record.get("description", "")).casefold():
+        return "Description"
+    agency = " ".join(
+        [
+            str(record.get("issuing_office", "")),
+            str(record.get("department", "")),
+            str(record.get("organization_path", "")),
+        ]
+    ).casefold()
+    if term in agency:
+        return "Agency"
+    if extraction and any(
+        term in (
+            f"{capability['name']} {capability['category']}"
+        ).casefold()
+        for capability in extraction["capabilities"]
+    ):
+        return "AI classification"
+    return "SAM.gov title search; the exact matching token is not visible."
+
+
+def _section_heading(title: str, description: str | None = None) -> None:
+    """Render a consistent section heading and optional supporting text."""
+    st.subheader(title)
+    if description:
+        st.caption(description)
+
+
+def _render_graph(
+    graph: Any,
+    empty_message: str,
+    *,
+    opportunity_layout: bool = False,
+) -> None:
+    """Render a relationship graph or a polished unavailable state."""
+    if graph.number_of_nodes() == 0:
+        st.info(empty_message)
+        return
+    chart_width: int | str = 1100 if opportunity_layout else "stretch"
+    st.graphviz_chart(
+        graph_to_dot(graph, opportunity_layout=opportunity_layout),
+        width=chart_width,
+    )
+    st.caption(
+        "Solid relationships use direct source evidence. Dashed relationships "
+        "represent post-validated AI extraction."
+    )
+
+
+def _build_sam_graph_demo(capability_count: int) -> Any:
+    """Build an in-memory SAM.gov-style graph without external API calls."""
+    opportunity = {
+        "source_record_id": "local-demo-opportunity",
+        "source": "Local demonstration data",
+        "evidence_type": "direct",
+        "issuing_office": "FBI-JEH",
+        "organization_id": "local-demo-agency",
+        "organization_path": "Federal Bureau of Investigation.FBI-JEH",
+        "title": "Enterprise GPU Servers for Artificial Intelligence",
+        "solicitation_number": "DEMO-ONLY",
+        "description": "Local presentation data used only to preview the graph.",
+        "posted_date": "2026-07-29",
+        "response_deadline": "2026-08-29",
+        "opportunity_type": "Sources Sought",
+        "naics_code": "541512",
+        "set_aside": "",
+        "source_url": "",
+        "retrieved_at": "local-demo",
+    }
+    capability_names = [
+        "AI systems",
+        "Pod-scale AI systems",
+        "AI inference servers and expansion hardware",
+        "High-speed networking components",
+        "OEM software and licenses",
+        "OEM warranty and technical support",
+    ]
+    extraction = {
+        "source_record_id": opportunity["source_record_id"],
+        "model": "local-demo-no-model",
+        "extracted_at": "local-demo",
+        "capabilities": [
+            {
+                "name": name,
+                "category": "local_demo",
+                "evidence_quote": "Local demonstration evidence.",
+                "confidence": 1.0,
+            }
+            for name in capability_names[:capability_count]
+        ],
+    }
+    graph = build_opportunity_graph([opportunity])
+    add_extracted_capabilities_to_graph(graph, opportunity, extraction)
+    return graph
+
+
+def _show_sam_graph_demo() -> None:
+    """Render an optional local graph preview that never mutates search state."""
+    with st.expander("Preview graph layout without using an API key"):
+        st.caption(
+            "This uses local demonstration data only. It does not call SAM.gov "
+            "or OpenAI and does not replace your saved search results."
+        )
+        show_demo = st.toggle(
+            "Show local graph demo",
+            key="show_sam_graph_demo",
+        )
+        if not show_demo:
+            st.write(
+                "Turn on the demo to inspect the SAM.gov graph layout. Turn it "
+                "off again to return to the normal tab."
+            )
+            return
+        capability_count = st.select_slider(
+            "Demo capability nodes",
+            options=list(range(1, 7)),
+            value=6,
+            help="Try different counts to confirm the graph remains readable.",
+        )
+        st.info(
+            "Demo mode is active for this preview only. All names and evidence "
+            "below are local sample data."
+        )
+        _render_graph(
+            _build_sam_graph_demo(capability_count),
+            "The local demo graph could not be created.",
+            opportunity_layout=True,
+        )
+
+
+def _award_table(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Build the primary contract-award table."""
     return pd.DataFrame(
         [
             {
-                "Recipient": record["recipient_name"],
-                "Award Amount": record["award_amount"],
-                "Agency": (
+                "Contractor": record["recipient_name"],
+                "Awarding office": (
                     record["awarding_sub_agency"]
                     or record["awarding_agency"]
+                    or "Not provided"
                 ),
-                "Start Date": record["start_date"],
-                "End Date": record["end_date"],
-                "Description": record["description"],
+                "Award amount": _format_currency(record["award_amount"]),
+                "Start date": _format_date(record["start_date"], False),
+                "Description": _shorten(record["description"]),
+                "Source": _safe_public_url(record.get("source_url")),
             }
             for record in records
         ]
     )
 
 
-def _show_results(
-    records: list[dict[str, Any]],
-    validation_errors: list[dict[str, Any]],
-) -> None:
-    """Render normalized awards, summary metrics, and validation warnings."""
-    if validation_errors:
-        st.warning(
-            f"{len(validation_errors)} record(s) could not be normalized and "
-            "were excluded from the table."
+def _opportunity_status(record: dict[str, Any]) -> str:
+    """Convert SAM.gov's active flag into a concise status."""
+    active = record.get("active")
+    if isinstance(active, bool):
+        return "Active" if active else "Inactive"
+    if str(active).strip().casefold() in {"yes", "true", "active", "1"}:
+        return "Active"
+    if str(active).strip():
+        return str(active)
+    return "Active"
+
+
+def _opportunity_table(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Build the primary SAM.gov opportunity table."""
+    return pd.DataFrame(
+        [
+            {
+                "Opportunity title": record["title"],
+                "Organization": (
+                    record["issuing_office"]
+                    or record["department"]
+                    or "Not provided"
+                ),
+                "Posted date": _format_date(record["posted_date"], False),
+                "Response deadline": _format_date(
+                    record["response_deadline"],
+                    None,
+                ),
+                "Opportunity type": record["opportunity_type"],
+                "Status": _opportunity_status(record),
+                "Source": _safe_public_url(record.get("source_url")),
+            }
+            for record in records
+        ]
+    )
+
+
+def _open_deadline_count(records: list[dict[str, Any]]) -> int:
+    """Count response deadlines that have not yet passed."""
+    values = pd.to_datetime(
+        [record.get("response_deadline") for record in records],
+        errors="coerce",
+        utc=True,
+    )
+    now = pd.Timestamp.now(tz="UTC")
+    return sum(not pd.isna(value) and value >= now for value in values)
+
+
+def _show_award_metrics(records: list[dict[str, Any]]) -> None:
+    """Render the four contract-award summary metrics."""
+    total_value = sum(record["award_amount"] for record in records)
+    contractors = {
+        record["recipient_name"].casefold()
+        for record in records
+        if record["recipient_name"]
+    }
+    agencies = {
+        (
+            record["awarding_sub_agency"]
+            or record["awarding_agency"]
+        ).casefold()
+        for record in records
+        if record["awarding_sub_agency"] or record["awarding_agency"]
+    }
+    columns = st.columns(4)
+    columns[0].metric("Awards found", len(records))
+    columns[1].metric("Total award value", _format_currency(total_value))
+    columns[2].metric("Unique contractors", len(contractors))
+    columns[3].metric("Unique agencies", len(agencies))
+
+
+def _show_opportunity_metrics(records: list[dict[str, Any]]) -> None:
+    """Render the four opportunity summary metrics."""
+    agencies = {
+        (
+            record["issuing_office"]
+            or record["department"]
+            or record["organization_path"]
+        ).casefold()
+        for record in records
+        if (
+            record["issuing_office"]
+            or record["department"]
+            or record["organization_path"]
         )
-        with st.expander("View record validation errors"):
-            st.json(validation_errors)
+    }
+    types = [
+        str(record["opportunity_type"])
+        for record in records
+        if record.get("opportunity_type")
+    ]
+    common_type = Counter(types).most_common(1)[0][0] if types else "Not provided"
+    columns = st.columns(4)
+    columns[0].metric("Opportunities found", len(records))
+    columns[1].metric("Open deadlines", _open_deadline_count(records))
+    columns[2].metric("Unique agencies", len(agencies))
+    columns[3].metric("Most common type", common_type)
 
-    if not records:
-        st.info("No valid awards were found for the selected search.")
-        return
 
-    total_award_value = sum(record["award_amount"] for record in records)
-    unique_recipients = len(
-        {record["recipient_name"].casefold() for record in records}
+def _show_award_details(record: dict[str, Any], query: str) -> None:
+    """Render selected-award details without hiding source values."""
+    _section_heading(
+        "Selected award details",
+        "The values below come from the selected normalized USAspending record.",
     )
-
-    award_metric, value_metric, recipient_metric = st.columns(3)
-    award_metric.metric("Number of awards", len(records))
-    value_metric.metric("Total award value", f"${total_award_value:,.2f}")
-    recipient_metric.metric("Unique recipients", unique_recipients)
-
-    st.subheader("Contract awards")
-    st.dataframe(
-        _results_table(records),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Award Amount": st.column_config.NumberColumn(
-                "Award Amount",
-                format="$%.2f",
-            )
-        },
-    )
-
-
-def _show_evidence_inspector(records: list[dict[str, Any]]) -> None:
-    """Render direct source evidence for a user-selected award."""
-    st.subheader("Evidence Inspector")
-    st.caption(
-        "Claims shown here are assembled directly from USAspending fields. "
-        "No inferred or language-model-generated conclusions are included."
-    )
-
-    selected_index = st.selectbox(
-        "Select an award",
-        options=range(len(records)),
-        format_func=lambda index: (
-            f"{records[index]['source_award_id']} — "
-            f"{records[index]['original_recipient_name']}"
-        ),
-    )
-    record = records[selected_index]
-    agency = record["awarding_sub_agency"] or record["awarding_agency"]
-    original_recipient = record["original_recipient_name"]
-
     with st.container(border=True):
-        st.markdown("**Human-readable direct claim**")
-        st.write(
-            f"USAspending reports that {agency} issued award "
-            f"{record['source_award_id']} to {original_recipient} for "
-            f"${record['award_amount']:,.2f}."
+        left, right = st.columns(2)
+        with left:
+            st.markdown(f"**{record['recipient_name']}**")
+            st.write(
+                _display_value(
+                    record["awarding_sub_agency"]
+                    or record["awarding_agency"]
+                )
+            )
+            st.write(f"**Award value:** {_format_currency(record['award_amount'])}")
+        with right:
+            st.write(
+                f"**Start date:** {_format_date(record['start_date'], False)}"
+            )
+            st.write(
+                f"**End date:** {_format_date(record['end_date'], False)}"
+            )
+            st.write(
+                f"**Award ID:** {_display_value(record['source_award_id'])}"
+            )
+        st.markdown("**Description**")
+        st.write(record["description"] or "No description was provided.")
+        st.markdown("**What this record tells you**")
+        office = (
+            record["awarding_sub_agency"]
+            or record["awarding_agency"]
+            or "The awarding office"
         )
+        st.write(
+            f"{office} awarded {_format_currency(record['award_amount'])} "
+            f"to {record['recipient_name']} under award "
+            f"{record['source_award_id']}."
+        )
+        st.write(f"**Why this matched:** {_why_award_matched(record, query)}")
 
-        st.markdown("**Direct USAspending fields**")
-        source_left, source_right = st.columns(2)
-        with source_left:
+
+def _show_award_evidence(record: dict[str, Any]) -> None:
+    """Render provenance for the selected award."""
+    _section_heading(
+        "Evidence and source information",
+        "Direct source fields remain separate from any later interpretation.",
+    )
+    with st.container(border=True):
+        st.markdown("**Direct source data · USAspending**")
+        st.write("Evidence classification: **Direct**")
+        source_url = _safe_public_url(record.get("source_url"))
+        if source_url:
+            st.link_button("Open USAspending source", source_url)
+        st.caption(
+            "AI-extracted information: none. Inferred information: none."
+        )
+        with st.expander("Technical provenance details"):
             st.write("Source record ID")
             st.code(str(record["source_award_id"]), language=None)
-            st.write("Original recipient name")
-            st.code(str(original_recipient), language=None)
-            st.write("Original award amount")
-            st.code(str(record["original_award_amount"]), language=None)
-        with source_right:
-            st.write("Original start date")
-            st.code(str(record["original_start_date"]), language=None)
-            st.write("Original end date")
-            st.code(str(record["original_end_date"]), language=None)
-            st.write("Original award description")
-            original_description = record["original_award_description"]
+            st.write("Generated internal ID")
             st.code(
-                "" if original_description is None else str(original_description),
+                _display_value(record["generated_internal_id"]),
+                language=None,
+            )
+            st.write("Original recipient name")
+            st.code(str(record["original_recipient_name"]), language=None)
+            st.write("Raw retrieval timestamp")
+            st.code(str(record["retrieved_at"]), language=None)
+            st.write("Original amount value")
+            st.code(
+                _format_currency(record["original_award_amount"]),
                 language=None,
             )
 
-        st.markdown("**MissionGraph evidence metadata**")
-        metadata_left, metadata_right, timestamp_column = st.columns(3)
-        metadata_left.metric("Evidence type", record["evidence_type"])
-        metadata_right.metric("Source", record["source"])
-        timestamp_column.write("Retrieved at (UTC)")
-        timestamp_column.code(record["retrieved_at"], language=None)
 
-
-def _show_award_search() -> None:
-    """Render the USAspending award-search interface."""
-    st.write(
-        "Explore Department of the Army contract awards using public federal "
-        "spending data from USAspending."
+def _show_capabilities(
+    extraction: dict[str, Any] | None,
+) -> None:
+    """Render post-validated AI capability extraction results."""
+    _section_heading(
+        "AI-extracted capabilities",
+        "Capabilities appear only after the selected notice is analyzed.",
     )
-
-    keyword = st.text_input(
-        "Keyword",
-        placeholder="For example: cybersecurity",
+    st.warning(
+        "AI-extracted fields should be reviewed against the supporting source "
+        "text. MissionGraph does not predict bidders, winners, or contract "
+        "outcomes."
     )
-
-    start_column, end_column = st.columns(2)
-    with start_column:
-        start_date = st.date_input(
-            "Start date",
-            value=date(date.today().year, 1, 1),
+    if extraction is None:
+        st.info(
+            "No AI analysis has been run for this opportunity. Use the button "
+            "above to analyze only the selected notice."
         )
-    with end_column:
-        end_date = st.date_input("End date", value=date.today())
-
-    limit = st.slider(
-        "Maximum results",
-        min_value=5,
-        max_value=50,
-        value=25,
-        step=5,
-    )
-
-    if "award_records" not in st.session_state:
-        st.session_state["award_records"] = None
-        st.session_state["validation_errors"] = []
-
-    if st.button("Search Awards", type="primary"):
-        if not keyword.strip():
-            st.error("Enter a keyword before searching.")
-            return
-        if start_date > end_date:
-            st.error("The start date must be on or before the end date.")
-            return
-
-        try:
-            with st.spinner("Retrieving USAspending contract awards..."):
-                raw_records = search_contract_awards(
-                    keyword=keyword,
-                    start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat(),
-                    limit=limit,
-                )
-                normalized_records, validation_errors = (
-                    normalize_award_records(raw_records)
-                )
-        except ValueError as exc:
-            st.error(f"Invalid search input: {exc}")
-            return
-        except USAspendingAPIError as exc:
-            st.error(
-                "USAspending could not complete the search. "
-                f"Please try again later. Details: {exc}"
-            )
-            return
-
-        st.session_state["award_records"] = normalized_records
-        st.session_state["validation_errors"] = validation_errors
-
-    current_records = st.session_state["award_records"]
-    if current_records is None:
         return
-    if not current_records and not st.session_state["validation_errors"]:
-        st.info("No awards matched the keyword and date range.")
-        return
-
-    _show_results(
-        current_records,
-        st.session_state["validation_errors"],
-    )
-    if current_records:
-        _show_evidence_inspector(current_records)
-
-
-def _show_capability_results(extraction: dict[str, Any]) -> None:
-    """Render AI-extracted capabilities with their supporting quotations."""
-    st.subheader("AI-extracted capabilities")
-    st.caption(
-        "These relationships are AI-extracted, not direct SAM.gov facts. "
-        "Every displayed quote passed exact-substring validation."
-    )
     capabilities = extraction["capabilities"]
     if not capabilities:
         st.info(
-            "No capability with an exact supporting quotation was extracted."
+            "No capability with an exact supporting quotation was retained."
         )
-        return
-
     for capability in capabilities:
-        with st.expander(capability["name"]):
-            st.write(f"Category: {capability['category']}")
-            st.write(f"Confidence: {capability['confidence']:.0%}")
-            st.write("Exact SAM.gov evidence quote:")
+        with st.container(border=True):
+            heading, confidence = st.columns([3, 1])
+            heading.markdown(f"**{capability['name']}**")
+            confidence.metric(
+                "Model confidence",
+                _confidence_label(capability["confidence"]),
+            )
+            st.caption(
+                f"Category: {_humanize_category(capability['category'])} · "
+                "Evidence type: ai_extracted"
+            )
+            st.markdown("**Exact supporting quotation**")
             st.info(capability["evidence_quote"])
-
-    st.caption(
-        f"Model: {extraction['model']} · "
-        f"Extracted at: {extraction['extracted_at']}"
-    )
-
-
-def _show_opportunity_analysis() -> None:
-    """Search SAM.gov and analyze only the opportunity selected by the user."""
-    st.write(
-        "Search active SAM.gov opportunities, then optionally extract "
-        "evidence-backed capabilities from one selected notice."
-    )
-
-    date_left, date_right = st.columns(2)
-    with date_left:
-        posted_from = st.date_input(
-            "Posted from",
-            value=date(date.today().year, 1, 1),
-            key="sam_posted_from",
-        )
-    with date_right:
-        posted_to = st.date_input(
-            "Posted to",
-            value=date.today(),
-            key="sam_posted_to",
-        )
-    title = st.text_input(
-        "Opportunity title contains",
-        key="sam_title",
-    )
-    limit = st.slider(
-        "Maximum SAM.gov results",
-        min_value=5,
-        max_value=50,
-        value=10,
-        step=5,
-    )
-
-    if "opportunity_raw_records" not in st.session_state:
-        st.session_state["opportunity_raw_records"] = None
-        st.session_state["opportunity_records"] = []
-        st.session_state["capability_extractions"] = {}
-
-    if st.button("Search SAM.gov Opportunities", type="primary"):
-        try:
-            with st.spinner("Retrieving active SAM.gov opportunities..."):
-                raw_records = search_opportunities(
-                    start_date=posted_from.isoformat(),
-                    end_date=posted_to.isoformat(),
-                    title=title or None,
-                    page_size=limit,
-                    max_pages=1,
+            st.caption(
+                f"Source record ID: {extraction['source_record_id']}"
+            )
+            with st.expander("Model confidence details"):
+                st.write(
+                    f"Numeric model score: "
+                    f"{capability['confidence']:.2f} "
+                    f"({capability['confidence']:.0%})"
                 )
-                opportunities = [
-                    normalize_opportunity(record) for record in raw_records
-                ]
-        except (ValueError, SamGovError) as exc:
-            st.error(f"SAM.gov search failed: {exc}")
+    if extraction.get("model"):
+        with st.expander("Technical provenance details"):
+            st.write(f"Model: {extraction['model']}")
+            st.write(f"Raw extraction timestamp: {extraction['extracted_at']}")
+            st.write(f"Source record ID: {extraction['source_record_id']}")
+
+
+def _show_opportunity_details(
+    record: dict[str, Any],
+    query: str,
+    extraction: dict[str, Any] | None,
+) -> None:
+    """Render selected-opportunity details."""
+    _section_heading(
+        "Selected opportunity details",
+        "Direct fields from the selected SAM.gov notice.",
+    )
+    with st.container(border=True):
+        st.markdown(f"**{record['title']}**")
+        left, right = st.columns(2)
+        with left:
+            st.write(
+                "**Organization:** "
+                + _display_value(
+                    record["issuing_office"]
+                    or record["department"]
+                    or record["organization_path"]
+                )
+            )
+            st.write(
+                "**Solicitation number:** "
+                + _display_value(record["solicitation_number"])
+            )
+            st.write(
+                "**Opportunity type:** "
+                + _display_value(record["opportunity_type"])
+            )
+        with right:
+            st.write(
+                f"**Posted date:** {_format_date(record['posted_date'], False)}"
+            )
+            st.write(
+                "**Response deadline:** "
+                + _format_date(record["response_deadline"], None)
+            )
+            st.write(f"**Status:** {_opportunity_status(record)}")
+        if record["description"]:
+            with st.expander("View retrieved source description"):
+                st.write(record["description"])
         else:
-            st.session_state["opportunity_raw_records"] = raw_records
-            st.session_state["opportunity_records"] = opportunities
-            st.session_state["capability_extractions"] = {}
-            st.session_state.pop("selected_opportunity_index", None)
+            st.caption(
+                "The full description will be retrieved only if this "
+                "opportunity is analyzed."
+            )
+        st.markdown("**What this record tells you**")
+        organization = (
+            record["issuing_office"]
+            or record["department"]
+            or record["organization_path"]
+            or "The issuing organization"
+        )
+        deadline = _format_date(record["response_deadline"], None)
+        st.write(
+            f"{organization} published this "
+            f"{_display_value(record['opportunity_type']).lower()} notice"
+            + (
+                f" with a response deadline of {deadline}."
+                if deadline != "Not provided"
+                else "."
+            )
+        )
+        st.write(
+            "**Why this matched:** "
+            + _why_opportunity_matched(record, query, extraction)
+        )
 
-    raw_records = st.session_state["opportunity_raw_records"]
-    opportunities = st.session_state["opportunity_records"]
-    if raw_records is None:
+
+def _show_opportunity_evidence(
+    record: dict[str, Any],
+    extraction: dict[str, Any] | None,
+) -> None:
+    """Render direct and AI evidence classes for one opportunity."""
+    _section_heading(
+        "Evidence and source information",
+        "MissionGraph keeps direct, AI-extracted, and inferred information "
+        "visibly distinct.",
+    )
+    with st.container(border=True):
+        st.markdown("**Direct source data · SAM.gov**")
+        st.write("Evidence classification: **Direct**")
+        source_url = _safe_public_url(record.get("source_url"))
+        if source_url:
+            st.link_button("Open SAM.gov source", source_url)
+
+        st.markdown("**AI-extracted information**")
+        if extraction is None:
+            st.write("No extraction has been run for this notice.")
+        else:
+            st.write(
+                f"{len(extraction['capabilities'])} post-validated "
+                "capability relationship(s)."
+            )
+        st.markdown("**Inferred information**")
+        st.write("None. MissionGraph does not infer procurement outcomes.")
+        with st.expander("Technical provenance details"):
+            st.write("Notice ID / source record ID")
+            st.code(str(record["source_record_id"]), language=None)
+            st.write("Raw retrieval timestamp")
+            st.code(str(record["retrieved_at"]), language=None)
+            st.write("Original description URL")
+            st.code(
+                _safe_public_url(record.get("original_description_url"))
+                or "Not provided",
+                language=None,
+            )
+            if extraction is not None:
+                st.write("Extraction model")
+                st.code(
+                    str(extraction["model"] or "Not called"),
+                    language=None,
+                )
+                st.write("Raw extraction timestamp")
+                st.code(str(extraction["extracted_at"]), language=None)
+
+
+def _show_award_tab() -> None:
+    """Render the complete contract-award workflow."""
+    st.write(
+        "Search Department of the Army prime contract awards and inspect each "
+        "result with traceable USAspending evidence."
+    )
+
+    with st.form("award_search_form", border=True):
+        keyword = st.text_input(
+            "Contract keyword",
+            placeholder="e.g., cybersecurity",
+            help="Searches USAspending award text for a required keyword.",
+        )
+        date_left, date_right, limit_column = st.columns([1, 1, 1])
+        with date_left:
+            start_date = st.date_input(
+                "Start date",
+                value=date(date.today().year - 1, 1, 1),
+                key="award_start_date",
+            )
+        with date_right:
+            end_date = st.date_input(
+                "End date",
+                value=date.today(),
+                key="award_end_date",
+            )
+        with limit_column:
+            limit = st.selectbox(
+                "Maximum results",
+                options=list(range(5, 51, 5)),
+                index=4,
+                help="Returns the first page of matching awards.",
+            )
+        submitted = st.form_submit_button(
+            "Search contract awards",
+            type="primary",
+            width="content",
+        )
+
+    if submitted:
+        if not keyword.strip():
+            st.error("Enter a contract keyword before searching.")
+        elif start_date > end_date:
+            st.error("Start date must be on or before end date.")
+        else:
+            try:
+                with st.spinner("Searching USAspending..."):
+                    raw_records = _cached_award_search(
+                        keyword.strip(),
+                        start_date.isoformat(),
+                        end_date.isoformat(),
+                        limit,
+                    )
+                    records, errors = normalize_award_records(raw_records)
+            except (ValueError, USAspendingAPIError):
+                st.error(
+                    "USAspending could not complete this search. Check the "
+                    "filters and try again shortly."
+                )
+            else:
+                st.session_state["award_records"] = records
+                st.session_state["award_validation_errors"] = errors
+                st.session_state["award_query"] = keyword.strip()
+                st.session_state["award_selection"] = (
+                    records[0]["source_award_id"] if records else None
+                )
+
+    records = st.session_state["award_records"]
+    if records is None:
+        st.info(
+            "No contract search has been run. Enter a keyword and submit the "
+            "form to begin."
+        )
         return
-    if not opportunities:
-        st.info("No active opportunities matched the search.")
+    errors = st.session_state["award_validation_errors"]
+    if errors:
+        st.warning(
+            f"{len(errors)} malformed source record(s) were excluded. "
+            "Their validation details remain available below."
+        )
+    if not records:
+        st.info("No contract awards matched the submitted filters.")
+        if errors:
+            with st.expander("View validation details"):
+                st.json(errors)
         return
 
-    selected_index = st.selectbox(
-        "Select one opportunity to analyze",
-        options=range(len(opportunities)),
-        format_func=lambda index: (
-            f"{opportunities[index]['notice_id']} — "
-            f"{opportunities[index]['title']}"
+    _show_award_metrics(records)
+    _section_heading("Contract award results")
+    st.dataframe(
+        _award_table(records),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Contractor": st.column_config.TextColumn(width="medium"),
+            "Awarding office": st.column_config.TextColumn(width="medium"),
+            "Award amount": st.column_config.TextColumn(width="small"),
+            "Start date": st.column_config.TextColumn(width="small"),
+            "Description": st.column_config.TextColumn(width="large"),
+            "Source": st.column_config.LinkColumn(
+                display_text="View source",
+                width="small",
+            ),
+        },
+    )
+
+    record_by_id = {
+        str(record["source_award_id"]): record for record in records
+    }
+    contractor_counts = Counter(
+        str(record.get("recipient_name") or "").casefold()
+        for record in records
+    )
+    duplicate_contractor_names = {
+        name for name, count in contractor_counts.items() if name and count > 1
+    }
+    if st.session_state["award_selection"] not in record_by_id:
+        st.session_state["award_selection"] = next(iter(record_by_id))
+    selected_id = st.selectbox(
+        "Select an award for details",
+        options=list(record_by_id),
+        format_func=lambda record_id: _award_dropdown_label(
+            record_by_id[record_id],
+            duplicate_contractor_names,
         ),
-        key="selected_opportunity_index",
+        key="award_selection",
     )
-    selected = opportunities[selected_index]
-    st.write(selected["title"])
-    st.caption(
-        f"SAM.gov notice {selected['source_record_id']} · "
-        f"Evidence type: {selected['evidence_type']}"
+    selected = record_by_id[selected_id]
+    _show_award_details(selected, st.session_state["award_query"])
+
+    _section_heading("Relationship graph")
+    try:
+        award_graph = build_award_graph([selected])
+    except ValueError:
+        st.info(
+            "A relationship graph is unavailable because this source record "
+            "does not include all required organization fields."
+        )
+    else:
+        _render_graph(award_graph, "No relationships are available.")
+    _show_award_evidence(selected)
+
+    if errors:
+        with st.expander("Excluded-record validation details"):
+            st.json(errors)
+
+
+def _normalize_opportunities(
+    raw_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize SAM.gov results while retaining malformed-record errors."""
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for index, raw_record in enumerate(raw_records):
+        try:
+            records.append(normalize_opportunity(raw_record))
+        except ValueError as exc:
+            errors.append(
+                {
+                    "index": index,
+                    "errors": [str(exc)],
+                    "record": raw_record,
+                }
+            )
+    return records, errors
+
+
+def _analyze_selected_opportunity(
+    selected: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retrieve one description once, then run selected-only extraction."""
+    record_id = selected["source_record_id"]
+    if record_id not in st.session_state["description_retrieved"]:
+        raw_record = st.session_state["opportunity_raw_by_id"][record_id]
+        description = fetch_opportunity_description(
+            str(selected.get("description_url") or "")
+        )
+        selected = normalize_opportunity(raw_record, description)
+        st.session_state["description_retrieved"].add(record_id)
+
+    extraction = extract_capabilities(
+        title=selected["title"],
+        description=selected["description"],
+        notice_id=record_id,
+    )
+    return selected, extraction
+
+
+def _show_opportunity_tab() -> None:
+    """Render the complete SAM.gov opportunity workflow."""
+    st.write(
+        "Search active federal notices, inspect direct SAM.gov fields, and "
+        "optionally extract technical capabilities from one selected record."
+    )
+    _show_sam_graph_demo()
+
+    with st.form("opportunity_search_form", border=True):
+        title = st.text_input(
+            "Opportunity title contains",
+            placeholder="e.g., software",
+            help="Leave blank to search all supported active notice types.",
+        )
+        date_left, date_right, limit_column = st.columns([1, 1, 1])
+        with date_left:
+            posted_from = st.date_input(
+                "Posted from",
+                value=date(date.today().year, 1, 1),
+                key="sam_posted_from",
+            )
+        with date_right:
+            posted_to = st.date_input(
+                "Posted to",
+                value=date.today(),
+                key="sam_posted_to",
+            )
+        with limit_column:
+            limit = st.selectbox(
+                "Maximum results",
+                options=list(range(5, 51, 5)),
+                index=1,
+                key="sam_limit",
+                help="Returns one page of active SAM.gov notices.",
+            )
+        submitted = st.form_submit_button(
+            "Search SAM.gov opportunities",
+            type="primary",
+            width="content",
+        )
+
+    if submitted:
+        if posted_from > posted_to:
+            st.error("Posted-from date must be on or before posted-to date.")
+        else:
+            try:
+                with st.spinner("Searching SAM.gov..."):
+                    raw_records = _cached_opportunity_search(
+                        posted_from.isoformat(),
+                        posted_to.isoformat(),
+                        title.strip(),
+                        limit,
+                    )
+                    records, errors = _normalize_opportunities(raw_records)
+            except (ValueError, SamGovError):
+                st.error(
+                    "SAM.gov could not complete this search. Confirm that "
+                    "SAM_API_KEY is configured, then try again."
+                )
+            else:
+                st.session_state["opportunity_records"] = records
+                st.session_state["opportunity_raw_by_id"] = {
+                    str(record.get("noticeId")): record
+                    for record in raw_records
+                    if str(record.get("noticeId", "")).strip()
+                }
+                st.session_state["opportunity_validation_errors"] = errors
+                st.session_state["opportunity_query"] = title.strip()
+                st.session_state["opportunity_selection"] = (
+                    records[0]["source_record_id"] if records else None
+                )
+                st.session_state["description_retrieved"] = set()
+                st.session_state["capability_extractions"] = {}
+
+    records = st.session_state["opportunity_records"]
+    if records is None:
+        st.info(
+            "No opportunity search has been run. Submit the form to retrieve "
+            "active SAM.gov notices."
+        )
+        return
+    errors = st.session_state["opportunity_validation_errors"]
+    if errors:
+        st.warning(
+            f"{len(errors)} malformed source record(s) were excluded from "
+            "the results."
+        )
+    if not records:
+        st.info("No active SAM.gov opportunities matched the submitted filters.")
+        if errors:
+            with st.expander("View validation details"):
+                st.json(errors)
+        return
+
+    _show_opportunity_metrics(records)
+    _section_heading("SAM.gov opportunity results")
+    st.dataframe(
+        _opportunity_table(records),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Opportunity title": st.column_config.TextColumn(width="large"),
+            "Organization": st.column_config.TextColumn(width="medium"),
+            "Posted date": st.column_config.TextColumn(width="small"),
+            "Response deadline": st.column_config.TextColumn(width="small"),
+            "Opportunity type": st.column_config.TextColumn(width="medium"),
+            "Status": st.column_config.TextColumn(width="small"),
+            "Source": st.column_config.LinkColumn(
+                display_text="View source",
+                width="small",
+            ),
+        },
     )
 
-    if st.button("Analyze Selected Opportunity"):
+    record_by_id = {
+        str(record["source_record_id"]): record for record in records
+    }
+    if st.session_state["opportunity_selection"] not in record_by_id:
+        st.session_state["opportunity_selection"] = next(iter(record_by_id))
+    selected_id = st.selectbox(
+        "Select an opportunity for details",
+        options=list(record_by_id),
+        format_func=lambda record_id: _opportunity_dropdown_label(
+            record_by_id[record_id]
+        ),
+        key="opportunity_selection",
+    )
+    selected = record_by_id[selected_id]
+    existing_extraction = st.session_state["capability_extractions"].get(
+        selected_id
+    )
+    _show_opportunity_details(
+        selected,
+        st.session_state["opportunity_query"],
+        existing_extraction,
+    )
+    button_label = (
+        "Re-analyze selected opportunity"
+        if existing_extraction
+        else "Analyze selected opportunity"
+    )
+    if st.button(
+        button_label,
+        type="primary",
+        help="Only the selected notice is sent for AI extraction.",
+    ):
         try:
             with st.spinner(
-                "Retrieving its description and extracting capabilities..."
+                "Retrieving source text and extracting capabilities..."
             ):
-                description = fetch_opportunity_description(
-                    str(selected["description_url"] or "")
-                )
-                selected = normalize_opportunity(
-                    raw_records[selected_index],
-                    description_text=description,
-                )
-                extraction = extract_capabilities(
-                    title=selected["title"],
-                    description=selected["description"],
-                    notice_id=selected["source_record_id"],
-                )
-                graph = build_opportunity_graph([selected])
-                add_extracted_capabilities_to_graph(
-                    graph,
-                    selected,
-                    extraction,
-                )
-        except (ValueError, SamGovError, CapabilityExtractionError) as exc:
-            st.error(f"Selected opportunity analysis failed: {exc}")
+                selected, extraction = _analyze_selected_opportunity(selected)
+        except SamGovError:
+            st.error(
+                "The selected SAM.gov description could not be retrieved. "
+                "Try again shortly."
+            )
+        except CapabilityExtractionError:
+            st.error(
+                "AI analysis could not be completed. Verify OPENAI_API_KEY, "
+                "OPENAI_MODEL, API access, and billing, then try again."
+            )
+        except ValueError:
+            st.error(
+                "The selected notice does not contain enough valid source "
+                "information for analysis."
+            )
         else:
-            opportunities[selected_index] = selected
-            st.session_state["opportunity_records"] = opportunities
-            st.session_state["capability_extractions"][
-                selected["source_record_id"]
-            ] = extraction
-            st.session_state["selected_opportunity_graph"] = graph
+            for index, record in enumerate(records):
+                if record["source_record_id"] == selected_id:
+                    records[index] = selected
+                    break
+            st.session_state["opportunity_records"] = records
+            st.session_state["capability_extractions"][selected_id] = extraction
+            existing_extraction = extraction
 
-    existing_extraction = st.session_state["capability_extractions"].get(
-        selected["source_record_id"]
-    )
-    if existing_extraction:
-        _show_capability_results(existing_extraction)
+    _show_capabilities(existing_extraction)
+
+    _section_heading("Relationship graph")
+    try:
+        opportunity_graph = build_opportunity_graph([selected])
+        if existing_extraction is not None:
+            add_extracted_capabilities_to_graph(
+                opportunity_graph,
+                selected,
+                existing_extraction,
+            )
+    except ValueError:
+        st.info(
+            "A relationship graph is unavailable because this notice lacks "
+            "required organization fields."
+        )
+    else:
+        _render_graph(
+            opportunity_graph,
+            "No relationships are available.",
+            opportunity_layout=True,
+        )
+
+    _show_opportunity_evidence(selected, existing_extraction)
+    if errors:
+        with st.expander("Excluded-record validation details"):
+            st.json(errors)
+
+
+def _show_about() -> None:
+    """Render a compact project and affiliation statement."""
+    with st.expander("About MissionGraph"):
+        st.write(
+            "MissionGraph is an independent portfolio project built using "
+            "public USAspending and SAM.gov data. It demonstrates API "
+            "ingestion, data normalization, knowledge-graph modeling, "
+            "AI-supported extraction, and evidence-backed reasoning. It is "
+            "not affiliated with Torch.AI or the U.S. government."
+        )
 
 
 def main() -> None:
-    """Render the MissionGraph application."""
-    st.set_page_config(page_title="MissionGraph", layout="wide")
+    """Render the MissionGraph portfolio application."""
+    st.set_page_config(
+        page_title="MissionGraph",
+        page_icon=None,
+        layout="wide",
+    )
+    _initialize_state()
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+        }
+        .missiongraph-badges {
+            display: flex;
+            gap: 0.45rem;
+            margin: 0.6rem 0 0.25rem 0;
+        }
+        .missiongraph-badge {
+            background: #EDF2F7;
+            border: 1px solid #D6DEE7;
+            border-radius: 999px;
+            color: #465564;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.2rem 0.55rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("MissionGraph")
+    st.markdown("### Public federal contracting intelligence")
+    st.write(
+        "Connect historical awards, active opportunities, organizations, "
+        "contractors, and technical capabilities using traceable public data."
+    )
+    st.markdown(
+        """
+        <div class="missiongraph-badges" aria-label="MissionGraph data sources">
+          <span class="missiongraph-badge">USAspending</span>
+          <span class="missiongraph-badge">SAM.gov</span>
+          <span class="missiongraph-badge">Evidence-backed</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
     award_tab, opportunity_tab = st.tabs(
         ["Contract Awards", "SAM.gov Opportunities"]
     )
     with award_tab:
-        _show_award_search()
+        _show_award_tab()
     with opportunity_tab:
-        _show_opportunity_analysis()
+        _show_opportunity_tab()
+
+    st.divider()
+    _show_about()
 
 
 if __name__ == "__main__":

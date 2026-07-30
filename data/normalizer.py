@@ -86,12 +86,18 @@ def normalize_award_records(
             continue
 
         description = raw_record.get("Description")
+        generated_internal_id = raw_record.get("generated_internal_id")
+        source_url = (
+            "https://www.usaspending.gov/award/"
+            f"{generated_internal_id}/"
+            if generated_internal_id
+            else "https://www.usaspending.gov/"
+        )
         valid_records.append(
             {
                 "source_award_id": source_award_id,
-                "generated_internal_id": raw_record.get(
-                    "generated_internal_id"
-                ),
+                "generated_internal_id": generated_internal_id,
+                "source_url": source_url,
                 "recipient_name": recipient_name,
                 "original_recipient_name": original_recipient_name,
                 "award_amount": award_amount,

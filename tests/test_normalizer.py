@@ -28,6 +28,10 @@ def test_normalizes_complete_record() -> None:
     assert record["generated_internal_id"] == (
         "CONT_AWD_W91TEST25C0001_9700"
     )
+    assert record["source_url"] == (
+        "https://www.usaspending.gov/award/"
+        "CONT_AWD_W91TEST25C0001_9700/"
+    )
     assert record["recipient_name"] == "Example Systems, Inc."
     assert record["original_recipient_name"] == (
         "  Example Systems, Inc.  "
@@ -65,6 +69,7 @@ def test_normalizes_record_with_missing_optional_fields() -> None:
     assert records[0]["awarding_agency"] == ""
     assert records[0]["awarding_sub_agency"] == ""
     assert records[0]["generated_internal_id"] is None
+    assert records[0]["source_url"] == "https://www.usaspending.gov/"
     assert records[0]["start_date"] is None
     assert records[0]["end_date"] is None
 

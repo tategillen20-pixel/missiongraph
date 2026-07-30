@@ -99,6 +99,18 @@ def test_permits_empty_capability_list(
     assert extraction["capabilities"] == []
 
 
+def test_accepts_specific_defense_capability_category() -> None:
+    """The structured schema supports specific categories beyond other."""
+    capability = ExtractedCapability(
+        name="Digital engineering",
+        category="digital_engineering",
+        evidence_quote="digital engineering",
+        confidence=0.75,
+    )
+
+    assert capability.category == "digital_engineering"
+
+
 def test_empty_description_does_not_call_openai() -> None:
     """No source text produces an empty result without spending API tokens."""
     client = Mock()
