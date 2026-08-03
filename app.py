@@ -9,6 +9,18 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
+
+st.set_page_config(
+    page_title="MissionGraph",
+    page_icon="🛰️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# Load local, git-ignored credentials while preserving any values already
+# supplied by the deployment environment.
+load_dotenv(override=False)
 
 from ai.capability_extractor import (
     CapabilityExtractionError,
@@ -30,6 +42,100 @@ from services.samgov import (
 from services.usaspending import USAspendingAPIError, search_contract_awards
 
 PUBLIC_DATA_CACHE_TTL = 900
+
+
+def inject_custom_css() -> None:
+    """Apply MissionGraph's centralized, responsive visual system."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --mg-navy: #18324A; --mg-blue-gray: #415A77;
+            --mg-text: #17212B; --mg-secondary: #667085;
+            --mg-muted: #98A2B3; --mg-border: #E4E7EC;
+            --mg-surface: #FFFFFF; --mg-page: #F6F8FB;
+        }
+        .stApp { background: var(--mg-page); color: var(--mg-text); }
+        .block-container {
+            max-width: 1480px; padding: 3.75rem 2rem 2.5rem;
+        }
+        h1, h2, h3 { color: var(--mg-navy); letter-spacing: -0.02em; }
+        h2 { font-size: 1.35rem !important; }
+        h3 { font-size: 1.08rem !important; margin-top: .35rem !important; }
+        p, label { color: var(--mg-text); }
+        [data-testid="stCaptionContainer"] { color: var(--mg-secondary); }
+        .mg-header { padding: .15rem 0 1rem; border-bottom: 1px solid var(--mg-border); }
+        .mg-title { color: var(--mg-navy); font-size: 2.15rem; font-weight: 750;
+            letter-spacing: -.04em; line-height: 1.05; margin: 0 0 .35rem; }
+        .mg-subtitle { color: var(--mg-blue-gray); font-size: 1.02rem;
+            font-weight: 650; margin-bottom: .25rem; }
+        .mg-support { color: var(--mg-secondary); font-size: .92rem; max-width: 840px; }
+        .mg-badges { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .7rem; }
+        .mg-badge { background: #EEF4FF; border: 1px solid #D8E5FF;
+            border-radius: 999px; color: var(--mg-blue-gray); font-size: .72rem;
+            font-weight: 650; padding: .18rem .55rem; }
+        .mg-empty { background: #FFF; border: 1px dashed #CFD6E0;
+            border-radius: 12px; color: var(--mg-secondary); margin: .75rem 0;
+            padding: 1rem 1.15rem; }
+        div[data-testid="stForm"], div[data-testid="stVerticalBlockBorderWrapper"] {
+            background: var(--mg-surface); border-color: var(--mg-border) !important;
+            border-radius: 12px !important; box-shadow: 0 1px 2px rgba(16,24,40,.035);
+        }
+        div[data-testid="stMetric"] { background: #FFF; border: 1px solid var(--mg-border);
+            border-radius: 12px; padding: .85rem 1rem; min-height: 98px; }
+        div[data-testid="stMetricLabel"] { color: var(--mg-secondary); }
+        div[data-testid="stMetricValue"] { color: var(--mg-navy); font-size: 1.55rem; }
+        .stTabs [data-baseweb="tab-list"] { gap: 1.1rem; border-bottom: 1px solid var(--mg-border); }
+        .stTabs [data-baseweb="tab"] { color: var(--mg-secondary); font-weight: 600;
+            height: 3rem; padding: 0 .1rem; }
+        .stTabs [aria-selected="true"] { color: var(--mg-navy) !important; }
+        .stTabs [data-baseweb="tab-highlight"] { background: var(--mg-navy); }
+        .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"],
+        .stLinkButton > a { border-radius: 8px; font-weight: 650; min-height: 2.5rem; }
+        .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+            background: var(--mg-navy); border-color: var(--mg-navy); }
+        .stButton > button[kind="primary"]:hover,
+        .stFormSubmitButton > button[kind="primary"]:hover { background: #244762; }
+        [data-testid="stDataFrame"] { border: 1px solid var(--mg-border);
+            border-radius: 10px; overflow: hidden; }
+        [data-testid="stAlert"] { border-radius: 9px; padding: .65rem .85rem; }
+        [data-testid="stGraphVizChart"] { display: flex; justify-content: center;
+            overflow-x: auto; padding: .35rem 0; }
+        details { background: #FFF; border-color: var(--mg-border) !important; border-radius: 9px; }
+        @media (max-width: 760px) {
+            .block-container { padding: 3.5rem .9rem 2rem; }
+            .mg-title { font-size: 1.8rem; }
+            div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+            div[data-testid="column"] { min-width: min(100%, 260px); flex: 1 1 260px; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_app_header() -> None:
+    """Render the compact product identity and source badges."""
+    st.markdown(
+        """
+        <header class="mg-header">
+          <div class="mg-title">MissionGraph</div>
+          <div class="mg-subtitle">Public federal contracting intelligence</div>
+          <div class="mg-support">Connect historical awards, active opportunities,
+          organizations, contractors, and technical capabilities using traceable public data.</div>
+          <div class="mg-badges" aria-label="MissionGraph data sources">
+            <span class="mg-badge">USAspending</span><span class="mg-badge">SAM.gov</span>
+            <span class="mg-badge">Evidence-backed</span>
+          </div>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_empty_state(message: str) -> None:
+    """Render quiet, friendly guidance for an incomplete workflow."""
+    st.markdown(f'<div class="mg-empty">{message}</div>', unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=PUBLIC_DATA_CACHE_TTL, show_spinner=False)
@@ -265,18 +371,19 @@ def _render_graph(
     opportunity_layout: bool = False,
 ) -> None:
     """Render a relationship graph or a polished unavailable state."""
-    if graph.number_of_nodes() == 0:
-        st.info(empty_message)
-        return
-    chart_width: int | str = 1100 if opportunity_layout else "stretch"
-    st.graphviz_chart(
-        graph_to_dot(graph, opportunity_layout=opportunity_layout),
-        width=chart_width,
-    )
-    st.caption(
-        "Solid relationships use direct source evidence. Dashed relationships "
-        "represent post-validated AI extraction."
-    )
+    with st.container(border=True):
+        if graph.number_of_nodes() == 0:
+            render_empty_state(empty_message)
+            return
+        chart_width: int | str = 1050 if opportunity_layout else "stretch"
+        st.graphviz_chart(
+            graph_to_dot(graph, opportunity_layout=opportunity_layout),
+            width=chart_width,
+        )
+        st.caption(
+            "Evidence key: solid lines are direct source relationships; "
+            "dashed lines are post-validated AI extraction."
+        )
 
 
 def _build_sam_graph_demo(capability_count: int) -> Any:
@@ -530,14 +637,19 @@ def _show_award_evidence(record: dict[str, Any]) -> None:
         "Direct source fields remain separate from any later interpretation.",
     )
     with st.container(border=True):
-        st.markdown("**Direct source data · USAspending**")
-        st.write("Evidence classification: **Direct**")
-        source_url = _safe_public_url(record.get("source_url"))
-        if source_url:
-            st.link_button("Open USAspending source", source_url)
-        st.caption(
-            "AI-extracted information: none. Inferred information: none."
-        )
+        direct, ai_data, inferred = st.columns(3)
+        with direct:
+            st.markdown("🟢 **Direct source data**")
+            st.caption("USAspending · Direct evidence")
+            source_url = _safe_public_url(record.get("source_url"))
+            if source_url:
+                st.link_button("Open USAspending source", source_url)
+        with ai_data:
+            st.markdown("🟠 **AI-extracted information**")
+            st.caption("None for this record")
+        with inferred:
+            st.markdown("○ **Inferred information**")
+            st.caption("None")
         with st.expander("Technical provenance details"):
             st.write("Source record ID")
             st.code(str(record["source_award_id"]), language=None)
@@ -565,17 +677,16 @@ def _show_capabilities(
         "AI-extracted capabilities",
         "Capabilities appear only after the selected notice is analyzed.",
     )
-    st.warning(
-        "AI-extracted fields should be reviewed against the supporting source "
-        "text. MissionGraph does not predict bidders, winners, or contract "
-        "outcomes."
-    )
     if extraction is None:
-        st.info(
-            "No AI analysis has been run for this opportunity. Use the button "
-            "above to analyze only the selected notice."
+        render_empty_state(
+            "No AI analysis has been run for this opportunity yet. Analyze "
+            "the selected notice when you are ready to review extracted capabilities."
         )
         return
+    st.warning(
+        "Review AI-extracted fields against the quoted source text. "
+        "MissionGraph does not predict bidders, winners, or outcomes."
+    )
     capabilities = extraction["capabilities"]
     if not capabilities:
         st.info(
@@ -692,22 +803,24 @@ def _show_opportunity_evidence(
         "visibly distinct.",
     )
     with st.container(border=True):
-        st.markdown("**Direct source data · SAM.gov**")
-        st.write("Evidence classification: **Direct**")
-        source_url = _safe_public_url(record.get("source_url"))
-        if source_url:
-            st.link_button("Open SAM.gov source", source_url)
-
-        st.markdown("**AI-extracted information**")
-        if extraction is None:
-            st.write("No extraction has been run for this notice.")
-        else:
-            st.write(
-                f"{len(extraction['capabilities'])} post-validated "
-                "capability relationship(s)."
-            )
-        st.markdown("**Inferred information**")
-        st.write("None. MissionGraph does not infer procurement outcomes.")
+        direct, ai_data, inferred = st.columns(3)
+        with direct:
+            st.markdown("🟢 **Direct source data**")
+            st.caption("SAM.gov · Direct evidence")
+            source_url = _safe_public_url(record.get("source_url"))
+            if source_url:
+                st.link_button("Open SAM.gov source", source_url)
+        with ai_data:
+            st.markdown("🟠 **AI-extracted information**")
+            if extraction is None:
+                st.caption("Not analyzed")
+            else:
+                st.caption(
+                    f"{len(extraction['capabilities'])} post-validated relationship(s)"
+                )
+        with inferred:
+            st.markdown("○ **Inferred information**")
+            st.caption("None · Outcomes are not inferred")
         with st.expander("Technical provenance details"):
             st.write("Notice ID / source record ID")
             st.code(str(record["source_record_id"]), language=None)
@@ -731,12 +844,12 @@ def _show_opportunity_evidence(
 
 def _show_award_tab() -> None:
     """Render the complete contract-award workflow."""
-    st.write(
-        "Search Department of the Army prime contract awards and inspect each "
-        "result with traceable USAspending evidence."
-    )
-
     with st.form("award_search_form", border=True):
+        st.markdown("### Search contract awards")
+        st.caption(
+            "Find Department of the Army prime awards and inspect traceable "
+            "USAspending evidence."
+        )
         keyword = st.text_input(
             "Contract keyword",
             placeholder="e.g., cybersecurity",
@@ -798,9 +911,9 @@ def _show_award_tab() -> None:
 
     records = st.session_state["award_records"]
     if records is None:
-        st.info(
-            "No contract search has been run. Enter a keyword and submit the "
-            "form to begin."
+        render_empty_state(
+            "Search federal contract awards to inspect funding records, "
+            "contractors, and source-linked evidence."
         )
         return
     errors = st.session_state["award_validation_errors"]
@@ -810,18 +923,25 @@ def _show_award_tab() -> None:
             "Their validation details remain available below."
         )
     if not records:
-        st.info("No contract awards matched the submitted filters.")
+        render_empty_state(
+            "No matching records were found. Try adjusting the keyword, "
+            "date range, or result limit."
+        )
         if errors:
             with st.expander("View validation details"):
                 st.json(errors)
         return
 
     _show_award_metrics(records)
-    _section_heading("Contract award results")
+    _section_heading(
+        "Contract award results",
+        "Review the result set, then choose one award for a source-level inspection.",
+    )
     st.dataframe(
         _award_table(records),
         hide_index=True,
         width="stretch",
+        height=420,
         column_config={
             "Contractor": st.column_config.TextColumn(width="medium"),
             "Awarding office": st.column_config.TextColumn(width="medium"),
@@ -919,13 +1039,14 @@ def _analyze_selected_opportunity(
 
 def _show_opportunity_tab() -> None:
     """Render the complete SAM.gov opportunity workflow."""
-    st.write(
-        "Search active federal notices, inspect direct SAM.gov fields, and "
-        "optionally extract technical capabilities from one selected record."
-    )
     _show_sam_graph_demo()
 
     with st.form("opportunity_search_form", border=True):
+        st.markdown("### Search SAM.gov opportunities")
+        st.caption(
+            "Find active federal notices and inspect direct source fields "
+            "before optionally running AI extraction."
+        )
         title = st.text_input(
             "Opportunity title contains",
             placeholder="e.g., software",
@@ -993,9 +1114,9 @@ def _show_opportunity_tab() -> None:
 
     records = st.session_state["opportunity_records"]
     if records is None:
-        st.info(
-            "No opportunity search has been run. Submit the form to retrieve "
-            "active SAM.gov notices."
+        render_empty_state(
+            "Search active federal opportunities and inspect direct notice "
+            "fields before optionally running AI extraction."
         )
         return
     errors = st.session_state["opportunity_validation_errors"]
@@ -1005,18 +1126,25 @@ def _show_opportunity_tab() -> None:
             "the results."
         )
     if not records:
-        st.info("No active SAM.gov opportunities matched the submitted filters.")
+        render_empty_state(
+            "No matching records were found. Try adjusting the title, date "
+            "range, or result limit."
+        )
         if errors:
             with st.expander("View validation details"):
                 st.json(errors)
         return
 
     _show_opportunity_metrics(records)
-    _section_heading("SAM.gov opportunity results")
+    _section_heading(
+        "SAM.gov opportunity results",
+        "Review active notices, then choose one for a source-level inspection.",
+    )
     st.dataframe(
         _opportunity_table(records),
         hide_index=True,
         width="stretch",
+        height=420,
         column_config={
             "Opportunity title": st.column_config.TextColumn(width="large"),
             "Organization": st.column_config.TextColumn(width="medium"),
@@ -1092,9 +1220,10 @@ def _show_opportunity_tab() -> None:
             st.session_state["capability_extractions"][selected_id] = extraction
             existing_extraction = extraction
 
-    _show_capabilities(existing_extraction)
-
-    _section_heading("Relationship graph")
+    _section_heading(
+        "Relationship graph",
+        "A focused view of the selected notice and its evidence-backed relationships.",
+    )
     try:
         opportunity_graph = build_opportunity_graph([selected])
         if existing_extraction is not None:
@@ -1116,6 +1245,7 @@ def _show_opportunity_tab() -> None:
         )
 
     _show_opportunity_evidence(selected, existing_extraction)
+    _show_capabilities(existing_extraction)
     if errors:
         with st.expander("Excluded-record validation details"):
             st.json(errors)
@@ -1135,55 +1265,9 @@ def _show_about() -> None:
 
 def main() -> None:
     """Render the MissionGraph portfolio application."""
-    st.set_page_config(
-        page_title="MissionGraph",
-        page_icon=None,
-        layout="wide",
-    )
+    inject_custom_css()
     _initialize_state()
-    st.markdown(
-        """
-        <style>
-        .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
-        }
-        .missiongraph-badges {
-            display: flex;
-            gap: 0.45rem;
-            margin: 0.6rem 0 0.25rem 0;
-        }
-        .missiongraph-badge {
-            background: #EDF2F7;
-            border: 1px solid #D6DEE7;
-            border-radius: 999px;
-            color: #465564;
-            font-size: 0.75rem;
-            font-weight: 600;
-            padding: 0.2rem 0.55rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.title("MissionGraph")
-    st.markdown("### Public federal contracting intelligence")
-    st.write(
-        "Connect historical awards, active opportunities, organizations, "
-        "contractors, and technical capabilities using traceable public data."
-    )
-    st.markdown(
-        """
-        <div class="missiongraph-badges" aria-label="MissionGraph data sources">
-          <span class="missiongraph-badge">USAspending</span>
-          <span class="missiongraph-badge">SAM.gov</span>
-          <span class="missiongraph-badge">Evidence-backed</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.divider()
+    render_app_header()
 
     award_tab, opportunity_tab = st.tabs(
         ["Contract Awards", "SAM.gov Opportunities"]

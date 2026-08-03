@@ -8,11 +8,11 @@ from typing import Any
 import networkx as nx
 
 NODE_STYLES = {
-    "agency": ("box", "#24557A", "#FFFFFF"),
-    "award": ("box", "#52677A", "#FFFFFF"),
-    "company": ("ellipse", "#2F6B5D", "#FFFFFF"),
-    "opportunity": ("box", "#52677A", "#FFFFFF"),
-    "capability": ("ellipse", "#8A6D3B", "#FFFFFF"),
+    "agency": ("box", "#18324A", "#FFFFFF"),
+    "award": ("box", "#415A77", "#FFFFFF"),
+    "company": ("ellipse", "#067647", "#FFFFFF"),
+    "opportunity": ("box", "#415A77", "#FFFFFF"),
+    "capability": ("ellipse", "#B54708", "#FFFFFF"),
 }
 
 RELATIONSHIP_LABELS = {
@@ -114,8 +114,8 @@ def graph_to_dot(
         f'  node [fontname="Arial", {default_node_size}, '
         'style="rounded,filled", penwidth="1.0", fixedsize="false"];',
         f'  edge [fontname="Arial", fontsize="{edge_font_size}", '
-        'color="#6B7C8F", '
-        'fontcolor="#465564", arrowsize="0.7", penwidth="1.1"];',
+        'color="#667085", '
+        'fontcolor="#415A77", arrowsize="0.7", penwidth="1.1"];',
     ]
 
     for node_id, attributes in graph.nodes(data=True):
@@ -162,7 +162,7 @@ def graph_to_dot(
         )
         evidence_type = attributes.get("evidence_type")
         style = "dashed" if evidence_type == "ai_extracted" else "solid"
-        color = "#8A6D3B" if evidence_type == "ai_extracted" else "#6B7C8F"
+        color = "#B54708" if evidence_type == "ai_extracted" else "#667085"
         lines.append(
             f'  "{_dot_escape(source)}" -> "{_dot_escape(target)}" '
             f'[label="{relationship}", style="{style}", color="{color}"];'
